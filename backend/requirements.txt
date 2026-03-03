@@ -4,3 +4,6 @@ websockets
 groq
 python-dotenv
 edge-tts
+openai
+google-genai
+elevenlabs
