@@ -62,3 +62,12 @@ Browser security policies require webcam feeds and AudioContexts to be served ov
 - **Backend**: FastAPI, `websockets`, `edge-tts`, `AsyncGroq`.
 - **Vision**: `face-api.js` (tinyFaceDetector, faceExpressionNet).
 - **LLM**: `llama-3.1-8b-instant`.
+
+Running from the Terminal
+Since you already have VS Code (or your command prompt) open in the project folder, you can run it right there!
+
+Make sure your terminal is currently in the main vc_pro directory.
+Type this exactly as written and hit Enter: 
+```bash
+.\start_assistant.bat
+```

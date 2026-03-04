@@ -355,18 +355,7 @@
     </div>
 
     <!-- Main Logic -->
-    <script src="/frontend/app.js"></script>
-    <script>
-        // Fallback for when running http.server inside the frontend folder directly
-        window.addEventListener('error', function (e) {
-            if (e.target.tagName === 'SCRIPT' && e.target.src.includes('frontend/app.js')) {
-                console.log("Root path failed, trying relative path...");
-                const fallbackScript = document.createElement('script');
-                fallbackScript.src = 'app.js';
-                document.body.appendChild(fallbackScript);
-            }
-        }, true);
-    </script>
+    <script src="app.js"></script>
 </body>
 
 </html>

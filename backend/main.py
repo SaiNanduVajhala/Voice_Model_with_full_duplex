@@ -60,9 +60,9 @@ Do not use markdown formatting (like **bold** or asterisks) because it sounds ba
 """
 
 # === TTS ROUTING ===
-async def stream_audio_bytes(text: str, websocket: WebSocket, interrupt_event: asyncio.Event, voice_preference: str = "woman"):
+async def get_audio_bytes(text: str, interrupt_event: asyncio.Event, voice_preference: str = "woman"):
     if not any(c.isalnum() for c in text):
-        return
+        return b""
         
     global ACTIVE_TTS_PROVIDER
     provider = ACTIVE_TTS_PROVIDER
@@ -92,14 +92,14 @@ async def stream_audio_bytes(text: str, websocket: WebSocket, interrupt_event: a
                         output_format="mp3_44100_128",
                         optimize_streaming_latency=3 # Maximum latency optimization (sacrifices slight audio quality for extreme speed)
                     )
-                    audio_data = bytearray()
+                    # Collect into bytearray to send a complete MP3 file
+                    audio_data = b""
                     async for chunk in audio_generator:
-                        if interrupt_event.is_set(): return
+                        if interrupt_event.is_set(): return b""
                         if chunk:
-                            audio_data.extend(chunk)
-                    if audio_data and not interrupt_event.is_set():
-                        await websocket.send_bytes(bytes(audio_data))
-                    return # Exit successfully
+                            audio_data += chunk
+                    
+                    return audio_data
                 except Exception as e:
                     print(f"ElevenLabs Error: {e} -> Falling back to edge-tts")
                     ACTIVE_TTS_PROVIDER = "edge-tts"
@@ -114,31 +114,32 @@ async def stream_audio_bytes(text: str, websocket: WebSocket, interrupt_event: a
             }
             voice = edge_voices.get(voice_preference, TTS_VOICE_EDGE)
             communicate = edge_tts.Communicate(text, voice, rate="+20%")
-            audio_data = bytearray()
+            # Collect into bytearray to send a complete MP3 file
+            audio_data = b""
             async for chunk in communicate.stream():
-                if interrupt_event.is_set(): return
+                if interrupt_event.is_set(): return b""
                 if chunk["type"] == "audio":
-                    audio_data.extend(chunk["data"])
-            if audio_data and not interrupt_event.is_set():
-                await websocket.send_bytes(bytes(audio_data))
+                    audio_data += chunk["data"]
+            
+            return audio_data
                 
         elif provider == "openai_tts":
             if "openai" not in clients:
                 print("OpenAI API key missing.")
                 return
             
+            # OpenAI TTS doesn't support streaming well via SDK chunks yet, but we'll send it as one block
             response = await clients["openai"].audio.speech.create(
                 model="tts-1",
                 voice=TTS_VOICE_OPENAI,
                 input=text,
                 response_format="mp3"
             )
-            audio_data = response.content
-            if interrupt_event.is_set(): return
-            await websocket.send_bytes(audio_data)
+            return response.content
             
     except Exception as e:
         print(f"TTS Error ({provider}): {e}")
+        return b""
 
 # === LLM ROUTING ===
 async def generate_llm_response(messages: list, websocket: WebSocket, interrupt_event: asyncio.Event, voice_preference: str = "woman"):
@@ -153,7 +154,29 @@ async def generate_llm_response(messages: list, websocket: WebSocket, interrupt_
         
     full_response = ""
     sentence_buffer = ""
-    tts_tasks = set()
+    
+    tts_queue = asyncio.Queue()
+    
+    async def tts_worker():
+        while True:
+            task_data = await tts_queue.get()
+            if task_data is None:
+                tts_queue.task_done()
+                break
+            
+            if not interrupt_event.is_set():
+                try:
+                    text, voice_pref = task_data
+                    # Generate and send sequentially to guarantee exact order
+                    audio_data = await get_audio_bytes(text, interrupt_event, voice_pref)
+                    if audio_data and not interrupt_event.is_set():
+                        await websocket.send_bytes(audio_data)
+                except Exception as e:
+                    print(f"Error awaiting TTS task: {e}")
+            
+            tts_queue.task_done()
+            
+    worker_task = asyncio.create_task(tts_worker())
     
     try:
         # OpenAI, OpenRouter, and Groq all use the OpenAI Chat Completions standard
@@ -176,14 +199,12 @@ async def generate_llm_response(messages: list, websocket: WebSocket, interrupt_
                     print(content, end="", flush=True)
                     await websocket.send_text(json.dumps({"type": "text_chunk", "text": content}))
                     
-                    # Trigger TTS heavily on punctuation or if the buffer gets uncomfortably long.
+                    # Trigger TTS heavily on punctuation.
                     # This ensures ElevenLabs can add proper conversational inflections.
-                    if any(punc in content for punc in ['.', '!', '?', '\n']) or len(sentence_buffer) > 40:
+                    if any(punc in content for punc in ['.', '!', '?', '\n']) or (len(sentence_buffer) > 40 and ',' in content):
                         text_to_speak = sentence_buffer
                         sentence_buffer = ""
-                        tts_task = asyncio.create_task(stream_audio_bytes(text_to_speak, websocket, interrupt_event))
-                        tts_tasks.add(tts_task)
-                        tts_task.add_done_callback(tts_tasks.discard)
+                        await tts_queue.put((text_to_speak, voice_preference))
                         
         # Google Gemini uses a completely different structure
         elif provider == "gemini":
@@ -213,19 +234,19 @@ async def generate_llm_response(messages: list, websocket: WebSocket, interrupt_
                     sentence_buffer += content
                     print(content, end="", flush=True)
                     await websocket.send_text(json.dumps({"type": "text_chunk", "text": content}))
-                    # Trigger TTS heavily on punctuation or if the buffer gets uncomfortably long.
-                    if any(punc in content for punc in ['.', '!', '?', '\n']) or len(sentence_buffer) > 40:
+                    # Trigger TTS heavily on punctuation.
+                    if any(punc in content for punc in ['.', '!', '?', '\n']) or (len(sentence_buffer) > 40 and ',' in content):
                         text_to_speak = sentence_buffer
                         sentence_buffer = ""
-                        tts_task = asyncio.create_task(stream_audio_bytes(text_to_speak, websocket, interrupt_event, voice_preference))
-                        tts_tasks.add(tts_task)
-                        tts_task.add_done_callback(tts_tasks.discard)
+                        await tts_queue.put((text_to_speak, voice_preference))
 
         # Flush remaining buffer to TTS
         if sentence_buffer and not interrupt_event.is_set():
-            tts_task = asyncio.create_task(stream_audio_bytes(sentence_buffer, websocket, interrupt_event, voice_preference))
-            tts_tasks.add(tts_task)
-            tts_task.add_done_callback(tts_tasks.discard)
+            await tts_queue.put((sentence_buffer, voice_preference))
+            
+        # Stop worker
+        await tts_queue.put(None)
+        await worker_task
             
         print()
         return full_response
@@ -280,8 +301,20 @@ async def websocket_endpoint(websocket: WebSocket):
                             "gender": demo_data.get("gender", "unknown")
                         }))
                         print(f"Demographics Locked: {demo_data}")
+                    else:
+                        print("Gemini API not configured. Sending default demographics.")
+                        await websocket.send_text(json.dumps({
+                            "type": "demographic_update",
+                            "age": "unknown",
+                            "gender": "unknown"
+                        }))
                 except Exception as e:
                     print(f"Gemini Vision Error: {e}")
+                    await websocket.send_text(json.dumps({
+                        "type": "demographic_update",
+                        "age": "unknown",
+                        "gender": "unknown"
+                    }))
                 continue
             
             if data.get("interrupt"):
@@ -325,7 +358,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_text(json.dumps({"type": "text_chunk", "text": f"\n\n**[AI Interrupted You ({emotion.upper()})]**\n{interrupt_msg}\n\n"}))
                 
                 # Play the interruption audio immediately
-                await stream_audio_bytes(interrupt_msg, websocket, interrupt_event)
+                interrupt_audio = await get_audio_bytes(interrupt_msg, interrupt_event, voice_preference="woman")
+                if interrupt_audio and not interrupt_event.is_set():
+                    await websocket.send_bytes(interrupt_audio)
                 continue
                 
             user_text = data.get("user_text")

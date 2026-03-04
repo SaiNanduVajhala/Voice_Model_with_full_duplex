@@ -35,6 +35,8 @@ let audioQueue = [];
 let isPlaying = false;
 let activeSource = null;
 let gainNode = null;
+let currentRequestId = 0;
+let isGeneratingAudio = false;
 
 function initAudioContext() {
     if (!audioContext) {
@@ -74,11 +76,15 @@ function initWebSocket() {
                     currentGender = data.gender;
                     // Force the UI badge update immediately
                     emotionBadge.innerHTML = `Emotion: ${currentEmotion}<br/>Age: ${currentAge} | Gender: ${currentGender}`;
+                } else if (data.type === "interrupt_ack") {
+                    // Backend heard our interrupt
+                    console.log("Backend acknowledged interrupt.");
                 }
             } catch (e) {
                 console.log("Received string data:", event.data);
             }
         } else if (event.data instanceof ArrayBuffer) {
+            isGeneratingAudio = false; // We received audio, `isPlaying` will take over AEC
             // Stage 3: Received audio chunk
             await handleAudioChunk(event.data);
         }
@@ -162,7 +168,6 @@ async function initVision() {
 
                     // --- 2. Demographic Locking (Image Capture for Gemini) ---
                     if (!isDemographicsLocked) {
-                        isDemographicsLocked = true; // Instantly lock so we only send ONE frame to Gemini per face
                         currentAge = "Estimating...";
                         currentGender = "Estimating...";
 
@@ -175,6 +180,7 @@ async function initVision() {
                         const base64Image = tempCanvas.toDataURL('image/jpeg', 0.8);
 
                         if (ws && ws.readyState === WebSocket.OPEN) {
+                            isDemographicsLocked = true; // Instantly lock so we only send ONE frame to Gemini per face
                             ws.send(JSON.stringify({ type: 'analyze_demographics', image: base64Image }));
                         }
                     }
@@ -243,6 +249,9 @@ async function initSpeechRecognition() {
     recognition.interimResults = true;
     recognition.lang = 'en-US';
 
+    let reconnectDelay = 1000;
+
+
     recognition.onstart = () => {
         voiceOrb.classList.add('listening');
     };
@@ -261,32 +270,30 @@ async function initSpeechRecognition() {
 
         interimTextEl.innerText = interimTranscript;
 
-        // --- Software Acoustic Echo Cancellation (AEC) ---
-        // We are in Full-Duplex mode, meaning the mic is ALWAYS on.
+        // --- Aggressive Software Acoustic Echo Cancellation (AEC) ---
         let isEcho = false;
 
-        if (isPlaying) {
-            // We evaluate both the interim (fast, but hallucinates) and final (slow, but accurate) transcripts.
+        if (isPlaying || audioQueue.length > 0 || isGeneratingAudio) {
             const micTextRaw = (interimTranscript + finalTranscript).trim().toLowerCase();
             const micText = micTextRaw.replace(/[^\w\s\']|_/g, "").replace(/\s+/g, " ");
 
             const aiTextElements = transcriptBox.querySelectorAll('.ai-message');
-            if (aiTextElements.length > 0) {
-                let lastAiText = aiTextElements[aiTextElements.length - 1].innerText.toLowerCase();
-                if (aiTextElements.length > 1) {
-                    lastAiText += " " + aiTextElements[aiTextElements.length - 2].innerText.toLowerCase();
-                }
-                lastAiText = lastAiText.replace(/[^\w\s\']|_/g, "").replace(/\s+/g, " ");
+            if (aiTextElements.length > 0 && micText.length > 0) {
+                // Get the last 2 chunks to handle timing overlaps
+                let lastAiChunks = Array.from(aiTextElements).slice(-2).map(el => el.innerText.toLowerCase());
+                let combinedAi = lastAiChunks.join(" ").replace(/[^\w\s\']|_/g, "").replace(/\s+/g, " ");
 
-                if (lastAiText.includes(micText) && micText.length > 3) {
-                    isEcho = true; // Perfect substring match of speaker bleed
-                } else if (micText.length > 0) {
+                // 1. Exact Substring Match (Caught the AI script exactly)
+                if (combinedAi.includes(micText) && micText.length > 3) {
+                    isEcho = true;
+                } else {
+                    // 2. Fuzzy Word-Level Match (Homophones or near matches)
                     const micWords = micText.split(' ').filter(w => w.length > 2);
-                    const aiWords = lastAiText.split(' ');
+                    const aiWords = combinedAi.split(' ');
                     if (micWords.length > 0) {
-                        const intersection = micWords.filter(word => aiWords.includes(word));
-                        // If 40% or more of the words match the AI script, it's an echo.
-                        if (intersection.length / micWords.length >= 0.4) {
+                        const matches = micWords.filter(word => aiWords.some(aiW => aiW === word || aiW.startsWith(word) || word.startsWith(aiW)));
+                        // If 50% or more of the "important" words appear in the AI script, it's overwhelmingly likely to be an echo.
+                        if (matches.length / micWords.length >= 0.5) {
                             isEcho = true;
                         }
                     }
@@ -296,33 +303,29 @@ async function initSpeechRecognition() {
             // Genuine Barge-In Logic (While AI is speaking)
             if (!isEcho) {
                 const wordCount = micText.trim().split(/\s+/).length;
-
-                // 1. FAST PATH: Interim transcript grows significantly long without matching the AI script.
-                // Re-enables fast full-duplex interruption without waiting for the sentence to finish.
-                if (wordCount >= 3 && micText.length > 12) {
+                // We only interrupt if the user has said at least 4 words or a finalized sentence.
+                // This prevents short "static pops" from the speakers from killing the AI mid-sentence.
+                if (wordCount >= 4 && micText.length > 15) {
                     console.log("Genuine user interruption (Fast Path):", micText);
-                    if (gainNode) gainNode.gain.value = 1.0;
                     handleBargeIn();
-                }
-                // 2. SLOW PATH: User said something short (like "Stop"), so we wait for the STT to finalize it to be sure it wasn't a static pop.
-                else if (finalTranscript.trim().length > 0) {
-                    console.log("Genuine user interruption (Finalized Short Command):", micText);
-                    if (gainNode) gainNode.gain.value = 1.0;
+                } else if (finalTranscript.trim().length > 0) {
+                    console.log("Genuine user interruption (Final Path):", micText);
                     handleBargeIn();
                 }
             }
         } else {
-            if (gainNode) gainNode.gain.value = 1.0;
-
-            // Simple Barge-In Logic (When AI is silent)
+            // Standard flow when silent
             if (finalTranscript.trim().length > 0) {
                 handleBargeIn();
             }
         }
 
         if (!isEcho && finalTranscript.trim() !== '') {
+            console.log("Sending to backend:", finalTranscript);
             appendUserText(finalTranscript);
             sendToBackend(finalTranscript);
+        } else if (finalTranscript.trim() !== '') {
+            console.log("Audio dropped by AEC. isEcho:", isEcho, "isPlaying:", isPlaying, "isGeneratingAudio:", isGeneratingAudio, "queue:", audioQueue.length);
         }
     };
 
@@ -331,16 +334,31 @@ async function initSpeechRecognition() {
         if (event.error === 'not-allowed') {
             alert("Microphone access denied. Cannot proceed.");
             stopAssistant();
+        } else if (event.error === 'network') {
+            // Chrome throws this if it rate limits the connection to their servers. Back off to cool down.
+            reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+            console.warn(`Network error detected. Backing off for ${reconnectDelay}ms...`);
         }
     };
 
     recognition.onend = () => {
-        if (isAssistantActive) {
-            try {
-                recognition.start();
-            } catch (e) { }
+        if (isAssistantActive && !isGeneratingAudio && !isPlaying) {
+            setTimeout(() => {
+                try {
+                    recognition.start();
+                    reconnectDelay = 1000; // Reset delay on successful restart
+                } catch (e) { }
+            }, reconnectDelay);
         } else {
             voiceOrb.classList.remove('listening');
+
+            // If the AI is talking, still try to reconnect aggressively so barging-in works,
+            // but wrapped in a tiny timeout to avoid synchronous loop crashes
+            if (isAssistantActive) {
+                setTimeout(() => {
+                    try { recognition.start(); } catch (e) { }
+                }, 500);
+            }
         }
     };
 }
@@ -363,30 +381,43 @@ async function handleAudioChunk(arrayBuffer) {
     }
 }
 
+let scheduledSources = [];
+let nextStartTime = 0;
+
 function playNextInQueue() {
-    if (isPlaying || audioQueue.length === 0 || !audioContext) return;
+    if (!audioContext || audioQueue.length === 0) return;
 
-    isPlaying = true;
-    const buffer = audioQueue.shift();
-
-    activeSource = audioContext.createBufferSource();
-    activeSource.buffer = buffer;
-
-    // Audio Ducking Node Setup
-    if (!gainNode) {
-        gainNode = audioContext.createGain();
-        gainNode.connect(audioContext.destination);
+    if (nextStartTime === 0 || nextStartTime < audioContext.currentTime) {
+        nextStartTime = audioContext.currentTime + 0.05; // 50ms buffer to start safe
     }
-    gainNode.gain.value = 1.0; // Default full volume
-    activeSource.connect(gainNode);
 
-    activeSource.onended = () => {
-        isPlaying = false;
-        activeSource = null;
-        playNextInQueue();
-    };
+    while (audioQueue.length > 0) {
+        const buffer = audioQueue.shift();
+        const source = audioContext.createBufferSource();
+        source.buffer = buffer;
 
-    activeSource.start(0);
+        if (!gainNode) {
+            gainNode = audioContext.createGain();
+            gainNode.connect(audioContext.destination);
+        }
+        gainNode.gain.value = 1.0; // Default full volume
+        source.connect(gainNode);
+
+        source.start(nextStartTime);
+
+        scheduledSources.push(source);
+
+        source.onended = () => {
+            const index = scheduledSources.indexOf(source);
+            if (index > -1) scheduledSources.splice(index, 1);
+            if (scheduledSources.length === 0) {
+                isPlaying = false;
+            }
+        };
+
+        nextStartTime += buffer.duration;
+        isPlaying = true;
+    }
 }
 
 function handleBargeIn() {
@@ -403,32 +434,38 @@ function stopActiveAudioPlayback() {
     audioQueue = [];
 
     // Stop currently playing audio instantly
-    if (activeSource) {
+    scheduledSources.forEach(source => {
         try {
-            activeSource.onended = null; // Prevent it from triggering the next item in the queue
-            activeSource.stop();
+            source.onended = null; // Prevent it from triggering the next item in the queue
+            source.stop();
         } catch (e) {
             // ignore if already stopped
         }
         try {
-            activeSource.disconnect();
+            source.disconnect();
         } catch (e) { }
-        activeSource = null;
-    }
+    });
+
+    scheduledSources = [];
     isPlaying = false;
+    nextStartTime = 0;
 }
 
 function sendToBackend(text) {
     if (ws && ws.readyState === WebSocket.OPEN) {
+        isGeneratingAudio = true; // Block AEC while backend generates the first chunk
         isInterrupted = false; // Reset interruption flag for the new conversation turn
+        currentRequestId++; // Increment request ID for new turn
         const voiceSelector = document.getElementById('voice-persona');
         const payload = {
+            request_id: currentRequestId,
             user_text: text,
-            visual_context: currentEmotion,
-            age: currentAge,
-            gender: currentGender,
+            age: lockedAge || currentAge || "unknown",
+            gender: lockedGender || currentGender || "unknown",
+            visual_context: currentEmotion || "neutral",
             voice_preference: voiceSelector ? voiceSelector.value : "woman"
         };
+        console.log("Payload prepared:", payload);
         ws.send(JSON.stringify(payload));
     }
 }
