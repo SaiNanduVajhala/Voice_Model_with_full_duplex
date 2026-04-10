@@ -15,7 +15,7 @@ If someone wants to download and run this code on their laptop:
 1. Ensure they have **Python 3.9+** and **Git** installed.
 2. Clone the repository:
    ```bash
-   git clone https://github.com/SaiNanduVajhala/Voice_Communication_model_with-full_duplex_interruption.git
+   git clone https://github.com/SaiNanduVajhala/Voice_Model_with_full_duplex.git
    cd Voice_Communication_model_with-full_duplex_interruption
    ```
 3. Follow the **Backend** and **Frontend** setup steps below!
