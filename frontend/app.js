@@ -33,7 +33,9 @@ let isInterrupted = false;
 let audioContext = null;
 let audioQueue = [];
 let isPlaying = false;
+let lastAudioEndTime = 0;
 let activeSource = null;
+let filterNode = null;
 let gainNode = null;
 let currentRequestId = 0;
 let isGeneratingAudio = false;
@@ -273,12 +275,15 @@ async function initSpeechRecognition() {
         // --- Aggressive Software Acoustic Echo Cancellation (AEC) ---
         let isEcho = false;
 
-        if (isPlaying || audioQueue.length > 0 || isGeneratingAudio) {
+        if (isPlaying || audioQueue.length > 0 || isGeneratingAudio || (Date.now() - lastAudioEndTime < 2000)) {
             const micTextRaw = (interimTranscript + finalTranscript).trim().toLowerCase();
             const micText = micTextRaw.replace(/[^\w\s\']|_/g, "").replace(/\s+/g, " ");
 
+            // Hot-word bypass for immediate barge-in even if it looks like an echo
+            const isHotWordBargeIn = ["stop", "wait", "shut up", "hold on", "pause", "listen", "excuse me"].some(hw => micText.includes(hw));
+
             const aiTextElements = transcriptBox.querySelectorAll('.ai-message');
-            if (aiTextElements.length > 0 && micText.length > 0) {
+            if (!isHotWordBargeIn && aiTextElements.length > 0 && micText.length > 0) {
                 // Get the last 2 chunks to handle timing overlaps
                 let lastAiChunks = Array.from(aiTextElements).slice(-2).map(el => el.innerText.toLowerCase());
                 let combinedAi = lastAiChunks.join(" ").replace(/[^\w\s\']|_/g, "").replace(/\s+/g, " ");
@@ -288,29 +293,41 @@ async function initSpeechRecognition() {
                     isEcho = true;
                 } else {
                     // 2. Fuzzy Word-Level Match (Homophones or near matches)
-                    const micWords = micText.split(' ').filter(w => w.length > 2);
+                    // Only match significant words (length > 3) to avoid accidental matches on "you", "are", "the", "and"
+                    const micWords = micText.split(' ').filter(w => w.length > 3);
                     const aiWords = combinedAi.split(' ');
                     if (micWords.length > 0) {
                         const matches = micWords.filter(word => aiWords.some(aiW => aiW === word || aiW.startsWith(word) || word.startsWith(aiW)));
-                        // If 50% or more of the "important" words appear in the AI script, it's overwhelmingly likely to be an echo.
+                        // Use a 50% threshold for significant words
                         if (matches.length / micWords.length >= 0.5) {
                             isEcho = true;
                         }
+                    } else if (micText.length > 0 && micText.split(' ').length <= 2) {
+                        // Only contains tiny 1-3 letter filler words (e.g. "ah", "um", "oh") while AI is speaking
+                        isEcho = true;
                     }
                 }
             }
 
             // Genuine Barge-In Logic (While AI is speaking)
-            if (!isEcho) {
+            if ((!isEcho || isHotWordBargeIn) && micText.length > 0) {
                 const wordCount = micText.trim().split(/\s+/).length;
-                // We only interrupt if the user has said at least 4 words or a finalized sentence.
-                // This prevents short "static pops" from the speakers from killing the AI mid-sentence.
-                if (wordCount >= 4 && micText.length > 15) {
+                const isShortCommand = ["stop", "hey", "wait", "no", "yes", "shh", "okay"].includes(micText.toLowerCase()) || isHotWordBargeIn;
+
+                // Fast path for interruption (interim results)
+                if ((wordCount >= 3 && micText.length > 10) || isHotWordBargeIn) {
                     console.log("Genuine user interruption (Fast Path):", micText);
                     handleBargeIn();
                 } else if (finalTranscript.trim().length > 0) {
-                    console.log("Genuine user interruption (Final Path):", micText);
-                    handleBargeIn();
+                    // Final path for interruption
+                    if (wordCount >= 2 || isShortCommand) {
+                        console.log("Genuine user interruption (Final Path):", micText);
+                        handleBargeIn();
+                    } else {
+                        // Mark as echo to drop the false 1-word audio finalizing glitch from speakers
+                        console.log("Audio dropped by AEC (Finalized 1 unknown word):", micText);
+                        isEcho = true;
+                    }
                 }
             }
         } else {
@@ -397,11 +414,19 @@ function playNextInQueue() {
         source.buffer = buffer;
 
         if (!gainNode) {
+            // Cut low-end boomy frequencies (<300Hz) from the AI's output to prevent triggering the laptop mic
+            filterNode = audioContext.createBiquadFilter();
+            filterNode.type = 'highpass';
+            filterNode.frequency.value = 300; 
+
             gainNode = audioContext.createGain();
+            
+            // source -> filter -> gain -> speakers
+            filterNode.connect(gainNode);
             gainNode.connect(audioContext.destination);
         }
         gainNode.gain.value = 1.0; // Default full volume
-        source.connect(gainNode);
+        source.connect(filterNode);
 
         source.start(nextStartTime);
 
@@ -412,6 +437,7 @@ function playNextInQueue() {
             if (index > -1) scheduledSources.splice(index, 1);
             if (scheduledSources.length === 0) {
                 isPlaying = false;
+                lastAudioEndTime = Date.now();
             }
         };
 
@@ -448,6 +474,7 @@ function stopActiveAudioPlayback() {
 
     scheduledSources = [];
     isPlaying = false;
+    lastAudioEndTime = 0; // Reset so that the user's voice isn't incorrectly dropped after a barge-in
     nextStartTime = 0;
 }
 
